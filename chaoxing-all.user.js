@@ -75,6 +75,19 @@
     return ok;
   }
 
+  // ---- 运行意图持久化 ----
+  // 切章节/页面整页重载会清空内存状态，这里记住「用户是否想继续刷」：
+  // 点开始置位、手动停止或本轮跑完清除；重载后 boot 据此自动续跑。
+  function setRunIntent(on) {
+    gmSet('cx-run-intent', { on: !!on, t: Date.now() });
+  }
+  function getRunIntent() {
+    const v = gmGet('cx-run-intent', {});
+    if (!v || v.on !== true) return false;
+    // 太久之前的意图（隔天/隔周打开页面）不再自动续跑
+    if (!v.t || Date.now() - v.t > 12 * 3600000) return false;
+    return true;
+  }
   // ---- 敏感字段混淆（XOR + base64），防止存储文件和界面里出现明文 ----
   const OBF_SALT = 'cx-allinone-v2-7f3a91e4';
 
@@ -1506,6 +1519,7 @@
     }
     if (!inWorkWindow()) { STATE.phase = `不在时段 ${CFG.HOUR_START}-${CFG.HOUR_END}`; paintState(); return; }
 
+    setRunIntent(true);
     STATE.running = true; STATE.err = false; STATE.done = 0; STATE.userStopped = false; STATE.reviveCount = 0;
     STATE.phase = '启动中…';
     paintState();
@@ -1673,6 +1687,9 @@
     } finally {
       STATE.running = false;
       stopKeepReading();
+      // 能走到 finally，说明这一轮确实结束了（跑完/手动停/报错停），清掉运行意图。
+      // 整页重载时 JS 上下文被销毁、finally 不会执行，意图得以保留供 boot 续跑。
+      setRunIntent(false);
       paintState();
     }
   }
@@ -2218,6 +2235,7 @@
 
     $('#cx-run').onclick = () => runStudy();
     $('#cx-stop').onclick = () => {
+      setRunIntent(false);
       STATE.running = false;
       STATE.userStopped = true;
       STATE.err = false;
@@ -2526,5 +2544,14 @@
     }, 4000);
 
     setTimeout(() => refreshWork(), 1500);
+
+    // 整页重载后自动续跑：上次是点「开始」跑起来的、且不是手动停止，
+    // 重载把内存状态清空了，这里按持久化的运行意图重新拉起。
+    if (getRunIntent() && !STATE.running && inWorkWindow()) {
+      log('检测到上次在运行中被重载，5 秒后自动续跑');
+      setTimeout(() => {
+        if (getRunIntent() && !STATE.running && inWorkWindow()) runStudy();
+      }, 5000);
+    }
   })();
 })();
