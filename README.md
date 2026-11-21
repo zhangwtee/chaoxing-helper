@@ -26,7 +26,7 @@
 | 本地题库 | 面板 → 设置 → 题库 | 填 tikuAdapter 服务地址，如 `http://localhost:8060/adapter-service/search` |
 | AI 大模型 | 面板 → 设置 → AI | 填 API 地址、Key、模型名（兼容 OpenAI 格式，如 DeepSeek） |
 
-两项都是可选的，至少配一项才能答题。**API Key 只存在你自己的浏览器里**（Tampermonkey 隔离存储 + localStorage 备份），不会写进本仓库，也不会上传。
+两项都是可选的，至少配一项才能答题。**API Key 仅保存在使用者本地浏览器**（Tampermonkey 隔离存储 + localStorage 备份），不会写入本仓库，也不会上传到任何服务器。
 
 详细用法见 [使用说明.md](./使用说明.md)。
 
