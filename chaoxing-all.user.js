@@ -4,6 +4,8 @@
 // @version      2.0.0
 // @description  单面板：刷视频任务点 / 测验字体解密 / AI 或题库填答；不自动提交
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
+// @match        *://*.chaoxing.com/mooc-ans/zt/*
+// @match        *://*.chaoxing.com/mooc-ans/ztnodedetailcontroller/*
 // @require      https://cdn.jsdelivr.net/gh/photopea/Typr.js/src/Typr.js
 // @require      https://cdn.jsdelivr.net/gh/photopea/Typr.js/src/Typr.U.js
 // @require      https://cdn.jsdelivr.net/npm/blueimp-md5@2.19.0/js/md5.min.js
@@ -1024,17 +1026,145 @@
     keepAliveTimer = setInterval(tick, 3500 + Math.random() * 2500);
   }
 
-  // ==================== 加速模式（伪造心跳） ====================
+  // ==================== 专题页（ZT）阅读 ====================
+  // 专题页的阅读时长由页面自身的 setSetting 打点累计：#outerBody 滚动时，
+  // 页面 takepoint 依据滚动位置定位章节（curKid 变化）后调用 setSetting。
+  // 脚本只做「逐章加载 + 缓慢滚动」，token/t 全部由页面自己生成，不伪造数据。
+  const ZT = { running: false, targetMin: 60 };
+  const ztState = { pos: 0, dir: 1 };
+
+  function isZTPage() {
+    try {
+      if (window['dtype'] === 'ZT') return true;
+      const p = location.pathname || '';
+      return /\/mooc-ans\/zt(\/|$)/.test(p) || /ztnodedetailcontroller/.test(p);
+    } catch (e) { return false; }
+  }
+
+  function ztChapters() {
+    const out = [], seen = new Set();
+    $$('li.course_section a[href*="knowledgeId="]').forEach((a) => {
+      const m = (a.getAttribute('href') || '').match(/knowledgeId=(\d+)/);
+      if (!m) return;
+      const kid = m[1];
+      if (seen.has(kid)) return;
+      seen.add(kid);
+      const title = ((a.querySelector('.chapterText') || {}).textContent || a.textContent || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 30);
+      out.push({ kid, title });
+    });
+    return out;
+  }
+
+  function ztGetTop() {
+    return (document.documentElement && document.documentElement.scrollTop) ||
+           (document.body && document.body.scrollTop) || (window.pageYOffset || 0) || 0;
+  }
+  function ztSetTop(v) {
+    try { document.documentElement.scrollTop = v; } catch (e) {}
+    try { document.body.scrollTop = v; } catch (e) {}
+    try { if (window.scrollTo) window.scrollTo(0, v); } catch (e) {}
+  }
+  function ztMaxTop() {
+    const vh = window.innerHeight || 600;
+    return Math.max(0, Math.max(document.documentElement.scrollHeight || 0, document.body.scrollHeight || 0) - vh);
+  }
+
+  async function runZTStudy() {
+    if (ZT.running) { log('专题阅读已在运行'); return; }
+    if (!inWorkWindow()) { STATE.phase = `不在时段 ${CFG.HOUR_START}-${CFG.HOUR_END}`; paintState(); return; }
+    const chapters = ztChapters();
+    if (!chapters.length) {
+      log('⚠️ 未识别到专题目录，请确认左侧目录已加载');
+      STATE.phase = '专题目录未找到'; STATE.err = true; paintState(); return;
+    }
+    const cur = (($('#nodeIdInput') || {}).value) || ((location.search.match(/knowledgeId=(\d+)/) || [])[1]) || '';
+    const start = Math.max(0, chapters.findIndex((c) => c.kid === cur));
+    const goalMs = Math.max(1, ZT.targetMin || 60) * 60000;
+
+    setRunIntent(true);
+    ZT.running = true; STATE.running = true; STATE.err = false;
+    STATE.userStopped = false; STATE.done = 0; STATE.total = chapters.length;
+    log(`专题阅读启动：${chapters.length} 章，目标 ${ZT.targetMin} 分钟；滚动与打点由页面自身完成`);
+
+    const t0 = Date.now();
+    const loaded = new Set();
+    let i = start, lastLogMin = -1;
+    ztState.pos = ztGetTop(); ztState.dir = 1;
+    try {
+      while (STATE.running && !STATE.userStopped && Date.now() - t0 < goalMs) {
+        if (!inWorkWindow()) { STATE.phase = '超时段停止'; break; }
+        const ch = chapters[i];
+
+        // 加载本章内容：用页面自带的 loadMoreChapter，参数与 token 走页面原有逻辑
+        if (ch && !loaded.has(ch.kid)) {
+          if (typeof window.loadMoreChapter === 'function') {
+            try { window.loadMoreChapter(ch.kid); log(`加载专题章节 ${ch.title}`); } catch (e) {}
+          }
+          loaded.add(ch.kid);
+          await sleep(2500);
+        }
+
+        // 缓慢上下滚动，触发页面 takepoint 按位置定位章节 → 页面用自身 token 打点
+        const maxTop = ztMaxTop();
+        if (maxTop > 0) {
+          ztState.pos += ztState.dir * rnd([140, 260]);
+          if (ztState.pos >= maxTop) { ztState.pos = maxTop; ztState.dir = -1; }
+          else if (ztState.pos <= 0) { ztState.pos = 0; ztState.dir = 1; }
+          ztSetTop(ztState.pos);
+        }
+        const mins = (Date.now() - t0) / 60000;
+        const fm = Math.floor(mins);
+        if (fm > lastLogMin) { lastLogMin = fm; log(`专题阅读 ${mins.toFixed(1)}/${ZT.targetMin} 分钟${ch ? ' · ' + ch.title : ''}`); }
+        STATE.phase = `专题阅读 ${Math.min(mins, ZT.targetMin).toFixed(1)}/${ZT.targetMin} 分${ch ? ' · ' + ch.title : ''}`;
+        paintState();
+
+        // 一章滚到底后推进下一章，让 curKid 持续变化 → 页面持续打点
+        if (maxTop > 0 && ztState.pos >= maxTop - 2 && i < chapters.length - 1) {
+          i++; ztState.pos = 0; ztState.dir = 1;
+        } else if (i >= chapters.length - 1 && maxTop > 0 && ztState.pos <= 2) {
+          ztState.dir = 1;   // 到最后一章后从头再滚，维持打点到目标时长
+        }
+        await sleep(rnd([2000, 3600]));
+      }
+      if (STATE.running) STATE.phase = '专题阅读达标';
+    } catch (e) {
+      log('专题阅读异常：' + e.message);
+      STATE.phase = '异常：' + e.message; STATE.err = true;
+    } finally {
+      ZT.running = false; STATE.running = false;
+      setRunIntent(false);
+      paintState();
+      log(`专题阅读结束，累计 ${((Date.now() - t0) / 60000).toFixed(1)} 分钟（数据次日更新）`);
+    }
+  }
+
+  // ==================== 安全倍速（真实播放） ====================
+  // 只使用播放器原生 playbackRate，心跳由视频真实产生，服务端看到的是正常播放。
+  // 上限锁在 2.0 —— 学习通播放器 UI 官方就支持到 2x，超过这个倍速心跳的
+  // 「时间增量/间隔」比值会偏离正常播放，容易被服务端判异常。
+  const SAFE_RATE = { min: 1.0, max: 2.0, jitter: 0.15 };
   const ACCEL = {
     enabled: false,
+    speed: 1.5,             // 目标倍速（开启后每条视频在此附近小幅随机）
     concurrency: 3,
-    speed: 1.2,
-    templates: new Map(),   // jobid -> {base, params, rawUrl, first}
+    templates: new Map(),   // 旧版伪造心跳的采集模板（保留兼容，不再用于加速）
     running: false,
-    dumped: false,          // 是否已打印过一次参数差异
-    probeDone: false,       // 是否已做过「同进度重发」诊断
+    dumped: false,
+    probeDone: false,
   };
-  let syncAccelUI = () => {};   // 由 buildPanel 注入，供加速流程在外部更新开关 UI
+  let syncAccelUI = () => {};   // 由 buildPanel 注入，供加速开关在外部更新 UI
+
+  // 返回本条视频实际使用的倍速：未开启=1.0；开启=设定值附近随机，clamp 在安全区间。
+  // 直接在 video 元素上设置，模拟真人「偶尔调快一点」，避免每条都精确同一个倍速。
+  function targetRate(job) {
+    if (!ACCEL.enabled) return 1.0;
+    if (!job._cxRate) {
+      const j = (Math.random() * 2 - 1) * SAFE_RATE.jitter;
+      job._cxRate = Math.max(SAFE_RATE.min, Math.min(SAFE_RATE.max, ACCEL.speed + j));
+    }
+    return job._cxRate;
+  }
 
   // ==================== 阅读模式（阅读时长类任务） ====================
   // 阅读时长按服务端累计，通常次日才更新任务点。这里只做两件事：
@@ -1053,16 +1183,18 @@
       readHours: READ.waitHours,
       autoSubmit: CFG.AUTO_SUBMIT,
       btnScale: CFG.BTN_SCALE,
+      ztMin: ZT.targetMin,
     });
   }
   function loadPrefs() {
     const p = gmGet('cx-prefs', {});
     if (!p || typeof p !== 'object') return;
     if (Number.isFinite(p.answerDelay) && p.answerDelay >= 0 && p.answerDelay <= 60000) CFG.ANSWER_DELAY = p.answerDelay;
-    if (Number.isFinite(p.accelSpeed) && p.accelSpeed >= 0.5 && p.accelSpeed <= 5) ACCEL.speed = p.accelSpeed;
+    if (Number.isFinite(p.accelSpeed) && p.accelSpeed >= SAFE_RATE.min && p.accelSpeed <= SAFE_RATE.max) ACCEL.speed = p.accelSpeed;
     if (Number.isFinite(p.readHours) && p.readHours >= 1 && p.readHours <= 72) READ.waitHours = p.readHours;
     if (typeof p.autoSubmit === 'boolean') CFG.AUTO_SUBMIT = p.autoSubmit;
     if (Number.isFinite(p.btnScale) && p.btnScale >= 0.75 && p.btnScale <= 1.5) CFG.BTN_SCALE = p.btnScale;
+    if (Number.isFinite(p.ztMin) && p.ztMin >= 1 && p.ztMin <= 1440) ZT.targetMin = p.ztMin;
   }
   loadPrefs();
 
@@ -1347,7 +1479,8 @@
       }
       return { ok: false, waiting: true };
     }
-    if (Math.abs(v.playbackRate - CFG.FORCE_RATE) > 0.01) { try { v.playbackRate = CFG.FORCE_RATE; } catch (e) {} }
+    const rate = targetRate(job);
+    if (Math.abs(v.playbackRate - rate) > 0.01) { try { v.playbackRate = rate; } catch (e) {} }
     if (v.paused && !v.ended) { try { v.muted = true; v.play().catch(() => {}); } catch (e) {} }
     const dur = v.duration, cur = v.currentTime || 0;
     return { ok: true, dur, cur, paused: v.paused, ended: v.ended, localDone: v.ended || cur >= dur - 2 };
@@ -1517,6 +1650,8 @@
       log('⚠️ 已经在运行中（如果没动静，点「停止」再点「开始」）');
       return;
     }
+    // 专题页（ZT）是另一套页面结构，走独立的阅读打点流程
+    if (isZTPage()) { log('检测到专题页，切换到专题阅读模式'); await runZTStudy(); return; }
     if (!inWorkWindow()) { STATE.phase = `不在时段 ${CFG.HOUR_START}-${CFG.HOUR_END}`; paintState(); return; }
 
     setRunIntent(true);
@@ -1631,7 +1766,9 @@
           idleSince = 0;
           if (++guard > 100) { log('本章循环过多，跳到下一章'); break; }
 
-          const res = ACCEL.enabled ? await runOneAccel(next) : await runOneVideo(next);
+          // 安全倍速同样走真实播放：心跳由播放器真实产生，只是播放更快。
+          // 旧版 runOneAccel（伪造上报）已被服务端防重放拒绝，不再使用。
+          const res = await runOneVideo(next);
           log(`结果 ${res.r}${res.why ? ' - ' + res.why : ''}`);
 
           if (res.r === 'done') {
@@ -2009,15 +2146,20 @@
               <button class="cx-btn" id="cx-stop">停止</button>
             </div>
             <div class="cx-subrow">
-              <span class="cx-k">加速</span>
+              <span class="cx-k">安全倍速</span>
               <span id="cx-accel-state" class="cx-kval">关闭</span>
               <span id="cx-speed-wrap" style="display:none;align-items:center;gap:4px">
                 <span class="cx-k">×</span>
-                <input id="cx-speed" class="cx-mini" type="number" step="0.1" min="0.5" max="5" value="1.2" />
+                <input id="cx-speed" class="cx-mini" type="number" step="0.05" min="1" max="2" value="1.5" />
               </span>
               <button class="cx-btn cx-mini-btn" id="cx-accel">开启</button>
             </div>
-            <div class="cx-subrow">
+            <div class="cx-subrow" id="cx-zt-row" style="display:none">
+              <span class="cx-k">专题目标</span>
+              <input id="cx-zt-min" class="cx-mini" type="number" min="1" max="1440" step="5" value="60" />
+              <span class="cx-k">分钟</span>
+            </div>
+            <div class="cx-subrow" id="cx-read-row">
               <span class="cx-k">阅读模式</span>
               <span id="cx-read-state" class="cx-kval">关闭</span>
               <span id="cx-read-hours-wrap" style="display:none;align-items:center;gap:4px">
@@ -2239,6 +2381,7 @@
       STATE.running = false;
       STATE.userStopped = true;
       STATE.err = false;
+      ZT.running = false;
       STATE.phase = '手动停止';
       stopKeepReading();
       // 真正把视频停下来
@@ -2270,15 +2413,24 @@
 
     $('#cx-speed').onchange = () => {
       const el = $('#cx-speed');
-      const v = parseFloat(el.value);
-      if (!(v >= 0.5) || v > 5) {
-        el.value = String(ACCEL.speed);
-        log('倍速要在 0.5 ~ 5 之间');
-        return;
-      }
+      let v = parseFloat(el.value);
+      if (!(v >= SAFE_RATE.min)) v = SAFE_RATE.min;
+      if (v > SAFE_RATE.max) v = SAFE_RATE.max;
       ACCEL.speed = v;
+      el.value = String(v);
       savePrefs();
-      log('加速倍速设为 ×' + v + '（下一条视频生效）');
+      // 已开启时立即对当前播放中的视频生效
+      if (ACCEL.enabled) {
+        let n = 0;
+        for (const j of videoJobs()) {
+          j._cxRate = null;
+          const vd = videoEl(j.frame);
+          if (vd) { try { vd.playbackRate = targetRate(j); n++; } catch (e) {} }
+        }
+        log(`安全倍速设为 ×${v}（已对当前 ${n} 个视频生效）`);
+      } else {
+        log(`安全倍速设为 ×${v}（开启后生效）`);
+      }
     };
 
     function showAccelConfirm() {
@@ -2288,16 +2440,16 @@
       m.innerHTML = `
         <div style="background:#141415;border:1px solid rgba(237,237,237,.10);border-radius:14px;padding:20px 20px;
           width:328px;box-shadow:0 24px 64px rgba(0,0,0,.55);font:12px/1.6 system-ui,sans-serif;color:#ededed">
-          <div style="font-size:13px;font-weight:500;margin-bottom:12px">开启加速模式</div>
+          <div style="font-size:13px;font-weight:500;margin-bottom:12px">开启安全倍速</div>
           <div style="color:#a1a1a6;font-size:12px;line-height:1.6;margin-bottom:16px">
-            开启后不再真实播放，改为伪造心跳上报。<br>
+            视频真实播放，仅把播放速度调快；心跳由播放器正常产生，和手动调倍速一致。<br>
             <div style="margin-top:8px;color:#ededed">
-              · 每个视频仍需真实播放约 60 秒预热<br>
-              · 之后按设定倍速伪造上报<br>
-              · 随时可点「关闭」回到真实播放
+              · 倍速限制在 1.0~2.0（学习通官方范围）<br>
+              · 每条视频在设定值附近小幅浮动，更接近真人<br>
+              · 随时可点「关闭」恢复 1.0 倍速
             </div>
-            <div style="margin-top:12px;padding:8px 12px;background:#241a1b;border-left:2px solid #e5484d;border-radius:4px;color:#c9a9aa">
-              当前版本服务端会拒：同一进度点重复上报会被判定无效，只改时间戳也拒。开启后大概率白等。
+            <div style="margin-top:12px;padding:8px 12px;background:#1b2a24;border-left:2px solid #4cc38a;border-radius:4px;color:#a9cbb8">
+              不伪造心跳、不改服务端数据，因此不会出现「上报被拒 / 白等」。倍速超过 2.0 反而异常，已锁死上限。
             </div>
           </div>
           <div style="display:flex;gap:8px">
@@ -2312,10 +2464,9 @@
         ACCEL.enabled = true;
         updateAccelUI();
         if (STATE.running) {
-          log('⚠️ 加速模式已开启，当前这条播完后自动生效');
-          log('（想立刻切换：点「停止」→ 再点「开始」）');
+          log(`✓ 安全倍速已开启 ×${ACCEL.speed}，已对当前播放中的视频生效`);
         } else {
-          log('⚠️ 加速模式已开启，点「开始」后生效');
+          log(`✓ 安全倍速已开启 ×${ACCEL.speed}，点「开始」后生效`);
         }
       };
     }
@@ -2325,7 +2476,12 @@
       if (ACCEL.enabled) {
         ACCEL.enabled = false;
         updateAccelUI();
-        log('已关闭加速模式，恢复真实播放');
+        for (const j of videoJobs()) {
+          j._cxRate = null;
+          const vd = videoEl(j.frame);
+          if (vd) { try { vd.playbackRate = 1.0; } catch (e) {} }
+        }
+        log('已关闭安全倍速，恢复 1.0 倍速播放');
       } else {
         showAccelConfirm();
       }
@@ -2483,6 +2639,29 @@
       refreshWork();
       log('已清空');
     };
+
+    // 专题页（ZT）：显示「专题目标分钟」，隐藏普通页的加速/阅读模式开关
+    const ztRow = $('#cx-zt-row');
+    if (isZTPage()) {
+      if (ztRow) ztRow.style.display = 'flex';
+      const accelRow = $('#cx-accel') && $('#cx-accel').closest('.cx-subrow');
+      if (accelRow) accelRow.style.display = 'none';
+      const readRow = $('#cx-read-row');
+      if (readRow) readRow.style.display = 'none';
+      const ztMin = $('#cx-zt-min');
+      if (ztMin) {
+        ztMin.value = String(ZT.targetMin);
+        ztMin.onchange = () => {
+          const v = parseFloat(ztMin.value);
+          if (!(v >= 1)) { ztMin.value = String(ZT.targetMin); return; }
+          ZT.targetMin = Math.min(1440, v);
+          ztMin.value = String(ZT.targetMin);
+          savePrefs();
+          log('专题阅读目标设为 ' + ZT.targetMin + ' 分钟');
+        };
+      }
+      log('专题页已就绪：点「开始」即进入专题阅读（滚动与打点由页面自身完成）');
+    }
 
     paintState();
     renderLog();
