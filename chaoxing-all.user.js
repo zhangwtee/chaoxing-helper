@@ -6,6 +6,9 @@
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
 // @match        *://*.chaoxing.com/mooc-ans/zt/*
 // @match        *://*.chaoxing.com/mooc-ans/ztnodedetailcontroller/*
+// @match        *://*.chaoxing.com/mooc-ans/mooc2/work/*
+// @match        *://*.chaoxing.com/mooc-ans/work/*
+// @noframes
 // @require      https://cdn.jsdelivr.net/gh/photopea/Typr.js/src/Typr.js
 // @require      https://cdn.jsdelivr.net/gh/photopea/Typr.js/src/Typr.U.js
 // @require      https://cdn.jsdelivr.net/npm/blueimp-md5@2.19.0/js/md5.min.js
@@ -184,7 +187,8 @@
       try { doc = win.document; } catch (e) { return null; }
       if (!doc || !doc.body) return null;
       try {
-        if (doc.querySelectorAll('.TiMu.newTiMu').length) return doc;
+        // 旧版题库页：.TiMu.newTiMu；新版作业页：.TiMu 下挂 .questionLi
+        if (doc.querySelectorAll('.TiMu.newTiMu, .TiMu .questionLi').length) return doc;
       } catch (e) {}
       let frames = [];
       try { frames = [...doc.querySelectorAll('iframe')]; } catch (e) {}
@@ -371,31 +375,70 @@
   }
 
   function parseWork(doc) {
-    return $$('.TiMu.newTiMu', doc).map((el, i) => {
-      const inp = el.querySelector('input[name^="answer"]');
+    // 旧版题库页题目节点是 .TiMu.newTiMu；新版作业页是 .TiMu 下挂 .questionLi
+    const oldNodes = $$('.TiMu.newTiMu', doc);
+    const newNodes = $$('.TiMu .questionLi', doc).filter((el) => !el.closest('.TiMu.newTiMu'));
+    const nodes = oldNodes.concat(newNodes);
+
+    return nodes.map((el, i) => {
+      // 注意 answertype 也是以 answer 开头的，必须排除，否则会读成答案
+      const inp = el.querySelector('input[name^="answer"]:not([name^="answertype"])');
+      const typeInp = el.querySelector('input[name^="answertype"]');
+      const typeVal = typeInp ? (typeInp.value || '').trim() : '';
+
       const lis = $$('li', el);
-      const opts = lis.map((li) => {
+      let opts = lis.map((li) => {
         const al = li.getAttribute('aria-label') || '';
         const mk = al.match(/^([A-Z])/);
         const mt = li.textContent.trim().match(/^([A-Z])[\s.．、]/);
         return { key: (mk && mk[1]) || (mt && mt[1]) || '', text: li.textContent.trim(), li };
       }).filter((o) => o.key);
 
-      let kind = 'unknown';
-      if (lis.length) kind = lis[0].getAttribute('role') === 'checkbox' ? 'multi' : 'single';
+      // 新版作业页：选项是 .answerBg，字母在 .num_option 上
+      if (!opts.length) {
+        opts = $$('.answerBg', el).map((bg) => {
+          // 单选是 num_option，多选是 num_option_dx，必须都认
+          const sp = bg.querySelector('[class*="num_option"]');
+          if (!sp) return null;
+          const data = (sp.getAttribute('data') || '').trim();
+          const key = /^[A-Z]$/.test(data) ? data : ((sp.textContent.trim().match(/^[A-Z]/) || [])[0] || '');
+          if (!key) return null;
+          const txtEl = bg.querySelector('.answer_p');
+          return { key, text: (txtEl ? txtEl.textContent : bg.textContent).trim().replace(/\s+/g, ' '), li: bg };
+        }).filter(Boolean);
+      }
+
       const tas = $$('textarea', el);
+      let kind = 'unknown';
       if (tas.length) kind = 'blank';
+      else if (typeVal === '1') kind = 'multi';
+      else if (typeVal === '3') kind = 'judge';
+      else if (typeVal === '0') kind = 'single';
+      else if (lis.length) kind = lis[0].getAttribute('role') === 'checkbox' ? 'multi' : 'single';
+      else if (opts.length) {
+        const bg = opts[0].li;
+        kind = /addMultipleChoice/.test(bg.getAttribute('onclick') || '') ? 'multi' : 'single';
+      }
 
       const editors = tas.map((ta) => {
         const box = findEditorBox(ta);
         return { ta, iframe: box ? box.querySelector('iframe') : null };
       });
 
-      const stemEl = el.querySelector('.qtContent, [class*="TItle"]');
+      const stemEl = el.querySelector('.qtContent, [class*="TItle"], .mark_name');
+      const stemP = stemEl && stemEl.querySelector('p');
+      const stem = stemP ? stemP.textContent.trim().replace(/\s+/g, ' ')
+        : (stemEl ? stemEl.textContent.trim().replace(/\s+/g, ' ') : '');
+
+      let qid = inp ? inp.name.replace('answer', '') : '';
+      if (!qid && typeInp) qid = typeInp.name.replace('answertype', '');
+      if (!qid && tas.length) {
+        const m = tas[0].id.match(/answerEditor(\d+)/);
+        if (m) qid = m[1];
+      }
+
       return {
-        idx: i, el, inp, kind, opts, editors, tas,
-        qid: inp ? inp.name.replace('answer', '') : '',
-        stem: stemEl ? stemEl.textContent.trim().replace(/\s+/g, ' ') : '',
+        idx: i, el, inp, kind, opts, editors, tas, qid, stem,
       };
     });
   }
@@ -442,6 +485,31 @@
   const saveBank = (b) => { try { localStorage.setItem('cx-work-bank', JSON.stringify(b)); } catch (e) {} };
   const fp = (q) => md5(q.stem + '||' + q.opts.map((o) => o.key + '.' + o.text).join('|')).slice(0, 16);
 
+  // 判分结果页：把「正确答案」读进本地题库，避免同类措辞/多选反复错
+  function learnFromResult() {
+    const doc = STATE.workDoc || findWorkDoc();
+    if (!doc) { log('当前页没识别到题目'); return; }
+    let n = 0;
+    parseWork(doc).forEach((q) => {
+      const txt = String((q.el.innerText || q.el.textContent || '')).replace(/\s+/g, ' ');
+      const m = txt.match(/正确答案[：:]\s*([\s\S]*?)(?:AI讲解|我的答案|$)/);
+      if (!m) return;
+      let ans = '';
+      if (q.opts.length) {
+        const valid = new Set(q.opts.map((o) => o.key));
+        ans = [...new Set((m[1].toUpperCase().match(/[A-Z]/g) || []).filter((c) => valid.has(c)))].sort().join('');
+      } else if (q.editors.length) {
+        let parts = [...m[1].matchAll(/\((\d+)\)\s*([^()；;]*)/g)].map((x) => x[2].trim()).filter(Boolean);
+        if (parts.length < q.editors.length) parts = m[1].split(/[|｜;；]/).map((s) => s.trim()).filter(Boolean);
+        ans = parts.slice(0, q.editors.length).join('|');
+      }
+      if (!ans) return;
+      const b = loadBank(); b[fp(q)] = ans; saveBank(b); n++;
+      log(`第${q.idx + 1}题 已存正确答案: ${ans}`);
+    });
+    log(`从结果页存入 ${n} 题`);
+  }
+
   // ==================== AI ====================
   function loadAI() {
     const v = gmGet('cx-ai-config', null);
@@ -471,13 +539,21 @@
   }
 
   function buildPrompt(q) {
-    const typeName = { multi: '多选题', single: '单选题', blank: '填空题' }[q.kind] || '题目';
+    const typeName = { multi: '多选题', single: '单选题', blank: '填空题', judge: '判断题' }[q.kind] || '题目';
     let s = `题型：${typeName}\n题目：${q.stem}\n`;
     if (q.opts.length) {
       s += '选项：\n' + q.opts.map((o) => `${o.key}. ${o.text}`).join('\n');
-      s += '\n\n只输出正确答案的选项字母（多选直接连写，如 ABD），不要任何解释、标点或空格。';
+      if (q.kind === 'judge') {
+        s += '\n\nA=对，B=错。只输出 A 或 B，不要解释。';
+      } else if (q.kind === 'multi') {
+        s += '\n\n这是多选题，正确答案可能不止一个。逐项核对每个选项是否符合题干（特别注意「不能」「不属于」「除了」等否定词），'
+          + '再把所有符合题意的字母按升序连写输出，如 BD。只输出字母，不要解释、标点或空格。';
+      } else {
+        s += '\n\n只输出一个最符合题意的选项字母（如 B），不要解释、标点或空格。';
+      }
     } else {
-      s += `\n这道题有 ${q.editors.length} 个空。只输出答案，多个空用 | 分隔，不要解释。`;
+      s += `\n这道题有 ${q.editors.length} 个空。只输出答案，多个空用 | 分隔。`
+        + '每空只写一个教材常用的简短术语，不要整句、不要解释。';
     }
     return s;
   }
@@ -522,7 +598,9 @@
     if (q.opts.length) {
       const letters = ans.toUpperCase().match(/[A-Z]/g);
       if (!letters) throw new Error('模型没给字母: ' + ans.slice(0, 40));
-      return [...new Set(letters)].sort().join('');
+      const uniq = [...new Set(letters)].sort();
+      // 单选/判断只取一个字母，避免模型多嘴导致多选成错答案
+      return (q.kind === 'single' || q.kind === 'judge') ? uniq[0] : uniq.join('');
     }
     return ans.replace(/^答案[:：]?\s*/, '').replace(/\n+/g, '|').trim();
   }
@@ -557,6 +635,10 @@
     try {
       for (let qi = 0; qi < qs.length; qi++) {
         const q = qs[qi];
+        if (!q.opts.length && !q.editors.length) {
+          log(`第${q.idx + 1}题 没解析出选项或输入框，跳过（页面结构可能变了）`);
+          continue;
+        }
         const key = fp(q);
         STATE.phase = `答题中 ${qi + 1}/${qs.length}`;
         setAiBusyUI(true, qi + 1, qs.length);
@@ -603,6 +685,7 @@
         if (r.ok) {
           ok++;
           filledKeys.add(fp(q));
+          log(`第${q.idx + 1}题 已写入网页: ${r.now}${r.how ? ' [' + r.how + ']' : ''}`);
           const inp = $(`#cx-panel .ansinp[data-idx="${q.idx}"]`);
           if (inp) inp.value = ans;
         } else {
@@ -619,6 +702,7 @@
         }
       }
       log(`答题完成：${ok}/${qs.length}`);
+      if (!ok) log('没拿到任何答案：题库连不上 / AI 没配置 / 题库无结果，检查设置和网络');
       if (ok > 0) log('★ 已填好，请核对后自己点页面上的「提交」');
       return filledKeys;
     } finally {
@@ -834,7 +918,8 @@
     }
     const k = a.answerKeyText || (a.answerKey && a.answerKey.join('')) || '';
     const letters = String(k).toUpperCase().replace(/[^A-Z]/g, '');
-    return letters || null;
+    if (!letters) return null;
+    return (q.kind === 'single' || q.kind === 'judge') ? letters[0] : [...new Set(letters)].sort().join('');
   }
 
   // ==================== 文档 / 阅读任务点：模拟阅读 ====================
@@ -1948,7 +2033,7 @@
 
     const bank = loadBank();
     const rows = qs.map((q) => {
-      const tn = { multi: '多选', single: '单选', blank: '填空' }[q.kind] || q.kind;
+      const tn = { multi: '多选', single: '单选', blank: '填空', judge: '判断' }[q.kind] || q.kind;
       const known = bank[fp(q)];
       const opts = q.opts.length
         ? q.opts.map((o) => `<div class="cx-opt">${o.key}. ${esc(o.text)}</div>`).join('')
@@ -1959,7 +2044,7 @@
           <div class="cx-q-hd">
             <span class="cx-q-no">${q.idx + 1}</span>
             <span class="cx-q-type">${tn}</span>
-            ${known ? '<span class="cx-tag">库</span>' : ''}
+            ${known ? `<span class="cx-tag">库</span><span class="cx-delbank" data-idx="${q.idx}" title="删除这题的本地答案">✕</span>` : ''}
             <span class="cx-cur curv">${esc(cur || '—')}</span>
           </div>
           <div class="cx-stem">${esc(q.stem.slice(0, 200))}</div>
@@ -2062,6 +2147,8 @@
 #cx-panel .cx-q-no{color:#a1a1a6;font-weight:500;font-size:12px}
 #cx-panel .cx-q-type{color:#85858b;font-size:10px;padding:2px 6px;background:#232325;border-radius:4px}
 #cx-panel .cx-tag{font-size:10px;padding:2px 6px;border-radius:4px;background:#1a2b22;color:#4cc38a}
+#cx-panel .cx-delbank{margin-left:6px;color:#85858b;cursor:pointer;font-size:10px;user-select:none}
+#cx-panel .cx-delbank:hover{color:#f33f34}
 #cx-panel .cx-cur{margin-left:auto;color:#4cc38a;font-size:11px;font-family:ui-monospace,monospace}
 #cx-panel .cx-stem{font-size:12px;line-height:1.6;color:#ededed;margin-bottom:4px;word-break:break-all}
 #cx-panel .cx-opt{font-size:11px;line-height:1.6;color:#a1a1a6;padding-left:8px;word-break:break-all}
@@ -2186,6 +2273,7 @@
               <button class="cx-btn" id="cx-fill">填充</button>
               <button class="cx-btn" id="cx-bank">存库</button>
               <button class="cx-btn" id="cx-clear">清空</button>
+              <button class="cx-btn" id="cx-learn" title="从判分结果页读取正确答案存入本地题库">学答案</button>
             </div>
             <div class="cx-subrow">
               <span class="cx-k">答题停顿</span>
@@ -2551,11 +2639,12 @@
 
     $('#cx-fill').onclick = () => {
       if (!STATE.workDoc) { log('没有测验'); return; }
-      let ok = 0, bad = 0;
+      let ok = 0, bad = 0, filled = 0;
       $$('#cx-panel .ansinp').forEach((inp) => {
         const i = +inp.dataset.idx;
         const v = inp.value.trim();
         if (!v) return;
+        filled++;
         const q = STATE.questions.find((x) => x.idx === i);
         if (!q) return;
         const r = fillOne(q, v);
@@ -2563,6 +2652,7 @@
         else { bad++; log(`第${i + 1}题 ❌ 期望${v} 实际${r.now}`); }
       });
       refreshWork();
+      if (!filled) log('面板输入框都是空的：先填答案，或点「智能答题」取答案');
       log(`填充 ${ok} 成功 / ${bad} 失败`);
     };
 
@@ -2629,6 +2719,10 @@
       log(`存 ${n} 题，累计 ${Object.keys(b).length}`);
     };
 
+    $('#cx-learn').onclick = () => {
+      try { learnFromResult(); } catch (e) { log('学答案失败: ' + e.message); }
+    };
+
     $('#cx-clear').onclick = () => {
       STATE.questions.forEach((q) => {
         if (q.kind === 'blank') q.editors.forEach((ed) => setEditor(ed, ''));
@@ -2639,6 +2733,19 @@
       refreshWork();
       log('已清空');
     };
+
+    // 删掉某一题的本地题库答案（AI 存错时用），面板重建后依然有效
+    panel.addEventListener('click', (e) => {
+      const del = e.target.closest('.cx-delbank');
+      if (!del) return;
+      const q = STATE.questions.find((x) => x.idx === +del.dataset.idx);
+      if (!q) return;
+      const b = loadBank();
+      delete b[fp(q)];
+      saveBank(b);
+      log(`第${q.idx + 1}题 已从本地题库删除`);
+      refreshWork();
+    });
 
     // 专题页（ZT）：显示「专题目标分钟」，隐藏普通页的加速/阅读模式开关
     const ztRow = $('#cx-zt-row');
@@ -2672,8 +2779,12 @@
   // ==================== 启动 ====================
   (function boot() {
     if (!document.body) { setTimeout(boot, 300); return; }
-    buildPanel();
-    log('已加载');
+    try {
+      buildPanel();
+      log('已加载 ' + location.pathname);
+    } catch (e) {
+      console.error('[cx] 面板构建失败', e);
+    }
 
     // 页面切走再回来：恢复播放；如果已经停机就自动重启
     document.addEventListener('visibilitychange', () => {
